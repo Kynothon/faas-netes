@@ -16,10 +16,12 @@ type FaaSHandlers struct {
 	ReplicaReader  http.HandlerFunc
 	ReplicaUpdater http.HandlerFunc
 	SecretHandler  http.HandlerFunc
+	// LogHandler provides streaming json logs of functions
+	LogHandler http.HandlerFunc
 
 	// Optional: Update an existing function
 	UpdateHandler http.HandlerFunc
-	Health        http.HandlerFunc
+	HealthHandler http.HandlerFunc
 	InfoHandler   http.HandlerFunc
 }
 

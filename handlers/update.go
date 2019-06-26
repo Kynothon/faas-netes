@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/openfaas/faas-netes/k8s"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -10,11 +11,10 @@ import (
 
 	"github.com/openfaas/faas/gateway/requests"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 )
 
 // MakeUpdateHandler update specified function
-func MakeUpdateHandler(functionNamespace string, clientset *kubernetes.Clientset) http.HandlerFunc {
+func MakeUpdateHandler(functionNamespace string, factory k8s.FunctionFactory) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
 		defer r.Body.Close()
@@ -29,12 +29,12 @@ func MakeUpdateHandler(functionNamespace string, clientset *kubernetes.Clientset
 		}
 
 		annotations := buildAnnotations(request)
-		if err, status := updateDeploymentSpec(functionNamespace, clientset, request, annotations); err != nil {
+		if err, status := updateDeploymentSpec(functionNamespace, factory, request, annotations); err != nil {
 			w.WriteHeader(status)
 			w.Write([]byte(err.Error()))
 		}
 
-		if err, status := updateService(functionNamespace, clientset, request, annotations); err != nil {
+		if err, status := updateService(functionNamespace, factory, request, annotations); err != nil {
 			w.WriteHeader(status)
 			w.Write([]byte(err.Error()))
 		}
@@ -45,12 +45,13 @@ func MakeUpdateHandler(functionNamespace string, clientset *kubernetes.Clientset
 
 func updateDeploymentSpec(
 	functionNamespace string,
-	clientset *kubernetes.Clientset,
+	factory k8s.FunctionFactory,
 	request requests.CreateFunctionRequest,
 	annotations map[string]string) (err error, httpStatus int) {
+
 	getOpts := metav1.GetOptions{}
 
-	deployment, findDeployErr := clientset.ExtensionsV1beta1().
+	deployment, findDeployErr := factory.Client.AppsV1beta2().
 		Deployments(functionNamespace).
 		Get(request.Service, getOpts)
 
@@ -68,7 +69,8 @@ func updateDeploymentSpec(
 
 		deployment.Spec.Template.Spec.Containers[0].Env = buildEnvVars(&request)
 
-		configureReadOnlyRootFilesystem(request, deployment)
+		factory.ConfigureReadOnlyRootFilesystem(request, deployment)
+		factory.ConfigureContainerUserID(deployment)
 
 		deployment.Spec.Template.Spec.NodeSelector = createSelector(request.Constraints)
 
@@ -101,7 +103,18 @@ func updateDeploymentSpec(
 
 		deployment.Spec.Template.Spec.Containers[0].Resources = *resources
 
-		existingSecrets, err := getSecrets(clientset, functionNamespace, request.Secrets)
+		var serviceAccount string
+
+		if request.Annotations != nil {
+			annotations := *request.Annotations
+			if val, ok := annotations["com.openfaas.serviceaccount"]; ok && len(val) > 0 {
+				serviceAccount = val
+			}
+		}
+
+		deployment.Spec.Template.Spec.ServiceAccountName = serviceAccount
+
+		existingSecrets, err := getSecrets(factory.Client, functionNamespace, request.Secrets)
 		if err != nil {
 			return err, http.StatusBadRequest
 		}
@@ -111,9 +124,17 @@ func updateDeploymentSpec(
 			log.Println(err)
 			return err, http.StatusBadRequest
 		}
+
+		probes, err := factory.MakeProbes(request)
+		if err != nil {
+			return err, http.StatusBadRequest
+		}
+
+		deployment.Spec.Template.Spec.Containers[0].LivenessProbe = probes.Liveness
+		deployment.Spec.Template.Spec.Containers[0].ReadinessProbe = probes.Readiness
 	}
 
-	if _, updateErr := clientset.ExtensionsV1beta1().
+	if _, updateErr := factory.Client.AppsV1beta2().
 		Deployments(functionNamespace).
 		Update(deployment); updateErr != nil {
 
@@ -125,13 +146,13 @@ func updateDeploymentSpec(
 
 func updateService(
 	functionNamespace string,
-	clientset *kubernetes.Clientset,
+	factory k8s.FunctionFactory,
 	request requests.CreateFunctionRequest,
 	annotations map[string]string) (err error, httpStatus int) {
 
 	getOpts := metav1.GetOptions{}
 
-	service, findServiceErr := clientset.CoreV1().
+	service, findServiceErr := factory.Client.CoreV1().
 		Services(functionNamespace).
 		Get(request.Service, getOpts)
 
@@ -141,7 +162,7 @@ func updateService(
 
 	service.Annotations = annotations
 
-	if _, updateErr := clientset.CoreV1().
+	if _, updateErr := factory.Client.CoreV1().
 		Services(functionNamespace).
 		Update(service); updateErr != nil {
 

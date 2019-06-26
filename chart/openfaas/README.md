@@ -70,6 +70,13 @@ helm repo update \
 
 > The above command will also update your helm repo to pull in any new releases.
 
+A note on health-checking probes for functions:
+
+* httpProbe - most efficient, currently incompatible with Istio
+* execProbe - least efficient health-checking, but most compatible
+
+If you want to switch from "exec" liveness and readiness probes to httpProbes then use `--set faasnetes.httpProbe=true`.
+
 ### Verify the installation
 
 Once all the services are up and running, log into your gateway using the OpenFaaS CLI. This will cache your credentials into your `~/.openfaas/config.yml` file.
@@ -146,6 +153,16 @@ helm upgrade --install openfaas openfaas/ \
 
 By default a NodePort will be created for the API Gateway.
 
+### Metrics
+
+You temporarily access the Prometheus metrics by ueing `port-forward`
+
+```
+kubectl --namespace openfaas port-forward deployment/prometheus 31119:9090
+```
+
+Then open `http://localhost:31119` to directly query the OpenFaaS metrics scraped by Prometheus.
+
 ### LB
 
 If you're running on a cloud such as AKS or GKE you will need to pass an additional flag of `--set serviceType=LoadBalancer` to tell `helm` to create LoadBalancer objects instead. An alternative to using multiple LoadBalancers is to install an Ingress controller.
@@ -166,13 +183,27 @@ If you require TLS/SSL then please make use of an IngressController. A full guid
 
 ## Zero scale
 
-Scaling up from zero replicas is enabled by default, to turn it off set `zero_scale` to false in the helm chart.
+### Scale-up from zero (on by default)
 
-Scaling to zero is done by the `faas-idler` component and by default will only carry out a dry-run. Pass the following to helm to enable scaling to zero replicas of idle functions. You will also need to [read the docs](https://docs.openfaas.com/architecture/autoscaling/#zero-scale) on how to configure functions to opt into scaling down.
+Scaling up from zero replicas is enabled by default, to turn it off set `scaleFromZero` to `false` in the helm chart options for the `gateway` component.
 
 ```sh
---set faasIdler.dryRun=false
+--set gateway.scaleFromZero=true/false
 ```
+
+### Scale-down to zero (off by default)
+
+Scaling down to zero replicas can be achieved either through the REST API and your own controller, or by using the [faas-idler](https://github.com/openfaas-incubator/faas-idler) component.
+
+By default the faas-idler is set to only do a dryRun and to not scale any functions down.
+
+```sh
+--set faasIdler.dryRun=true/false
+```
+
+The faas-idler will only scale down functions which have marked themselves as eligible for this behaviour through the use of a label: `com.openfaas.scale.zero=true`.
+
+See also: [faas-idler README](https://docs.openfaas.com/architecture/autoscaling/#zero-scale).
 
 ## Configuration
 
@@ -184,7 +215,7 @@ Additional OpenFaaS options in `values.yaml`.
 | `async` | Deploys NATS | `true` |
 | `exposeServices` | Expose `NodePorts/LoadBalancer`  | `true` |
 | `serviceType` | Type of external service to use `NodePort/LoadBalancer` | `NodePort` |
-| `basic_auth` | Enable basic authentication on the Gateway | `false` |
+| `basic_auth` | Enable basic authentication on the Gateway | `true` |
 | `rbac` | Enable RBAC | `true` |
 | `securityContext` | Deploy with a `securityContext` set, this can be disabled for use with Istio sidecar injection | `true` |
 | `openfaasImagePullPolicy` | Image pull policy for openfaas components, can change to `IfNotPresent` in offline env | `Always` |
@@ -192,9 +223,11 @@ Additional OpenFaaS options in `values.yaml`.
 | `operator.create` | Use the OpenFaaS operator CRD controller, default uses faas-netes as the Kubernetes controller | `false` |
 | `operator.createCRD` | Create the CRD for OpenFaaS Function definition | `true` |
 | `ingress.enabled` | Create ingress resources | `false` |
+| `faasnetes.httpProbe` | Use a httpProbe instead of exec | `false` |
 | `faasnetes.readTimeout` | Queue worker read timeout | `60s` |
 | `faasnetes.writeTimeout` | Queue worker write timeout | `60s` |
 | `faasnetes.imagePullPolicy` | Image pull policy for deployed functions | `Always` |
+| `faasnetes.setNonRootUser` | Force all function containers to run with user id `12000` | `false` |
 | `gateway.replicas` | Replicas of the gateway, pick more than `1` for HA | `1` |
 | `gateway.readTimeout` | Queue worker read timeout | `65s` |
 | `gateway.writeTimeout` | Queue worker write timeout | `65s` |
@@ -206,8 +239,8 @@ Additional OpenFaaS options in `values.yaml`.
 | `queueWorker.ackWait` | Max duration of any async task/request | `60s` |
 | `nats.enableMonitoring` | Enable the NATS monitoring endpoints on port `8222` | `false` |
 | `faasIdler.create` | Create the faasIdler component | `true` |
-| `faasIdler.inactivityDuration` | Duration after which faas-idler will scale function down to 0 | `5m` |
-| `faasIdler.reconcileInterval` | The time between each of reconciliation | `30s` |
+| `faasIdler.inactivityDuration` | Duration after which faas-idler will scale function down to 0 | `15m` |
+| `faasIdler.reconcileInterval` | The time between each of reconciliation | `1m` |
 | `faasIdler.dryRun` | When set to false the OpenFaaS API will be called to scale down idle functions, by default this is set to only print in the logs. | `true` |
 | `prometheus.create` | Create the Prometheus component | `true` |
 | `alertmanager.create` | Create the AlertManager component | `true` |

@@ -9,24 +9,20 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/openfaas/faas-netes/k8s"
+
 	"github.com/openfaas/faas/gateway/requests"
+	appsv1 "k8s.io/api/apps/v1beta2"
 	apiv1 "k8s.io/api/core/v1"
 	corev1 "k8s.io/api/core/v1"
-	v1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/kubernetes"
 )
-
-// watchdogPort for the OpenFaaS function watchdog
-const watchdogPort = 8080
 
 // initialReplicasCount how many replicas to start of creating for a function
 const initialReplicasCount = 1
@@ -45,23 +41,8 @@ func ValidateDeployRequest(request *requests.CreateFunctionRequest) error {
 	return fmt.Errorf("(%s) must be a valid DNS entry for service name", request.Service)
 }
 
-// FunctionProbeConfig specify options for Liveliness and Readiness checks
-type FunctionProbeConfig struct {
-	InitialDelaySeconds int32
-	TimeoutSeconds      int32
-	PeriodSeconds       int32
-}
-
-// DeployHandlerConfig specify options for Deployments
-type DeployHandlerConfig struct {
-	HTTPProbe                    bool
-	FunctionReadinessProbeConfig *FunctionProbeConfig
-	FunctionLivenessProbeConfig  *FunctionProbeConfig
-	ImagePullPolicy              string
-}
-
 // MakeDeployHandler creates a handler to create new functions in the cluster
-func MakeDeployHandler(functionNamespace string, clientset *kubernetes.Clientset, config *DeployHandlerConfig) http.HandlerFunc {
+func MakeDeployHandler(functionNamespace string, factory k8s.FunctionFactory) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 
@@ -80,14 +61,14 @@ func MakeDeployHandler(functionNamespace string, clientset *kubernetes.Clientset
 			return
 		}
 
-		existingSecrets, err := getSecrets(clientset, functionNamespace, request.Secrets)
+		existingSecrets, err := getSecrets(factory.Client, functionNamespace, request.Secrets)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte(err.Error()))
 			return
 		}
 
-		deploymentSpec, specErr := makeDeploymentSpec(request, existingSecrets, config)
+		deploymentSpec, specErr := makeDeploymentSpec(request, existingSecrets, factory)
 
 		if specErr != nil {
 			w.WriteHeader(http.StatusBadRequest)
@@ -95,7 +76,7 @@ func MakeDeployHandler(functionNamespace string, clientset *kubernetes.Clientset
 			return
 		}
 
-		deploy := clientset.Extensions().Deployments(functionNamespace)
+		deploy := factory.Client.AppsV1beta2().Deployments(functionNamespace)
 
 		_, err = deploy.Create(deploymentSpec)
 		if err != nil {
@@ -107,8 +88,8 @@ func MakeDeployHandler(functionNamespace string, clientset *kubernetes.Clientset
 
 		log.Println("Created deployment - " + request.Service)
 
-		service := clientset.Core().Services(functionNamespace)
-		serviceSpec := makeServiceSpec(request)
+		service := factory.Client.Core().Services(functionNamespace)
+		serviceSpec := makeServiceSpec(request, factory)
 		_, err = service.Create(serviceSpec)
 
 		if err != nil {
@@ -126,44 +107,8 @@ func MakeDeployHandler(functionNamespace string, clientset *kubernetes.Clientset
 	}
 }
 
-func makeDeploymentSpec(request requests.CreateFunctionRequest, existingSecrets map[string]*apiv1.Secret, config *DeployHandlerConfig) (*v1beta1.Deployment, error) {
+func makeDeploymentSpec(request requests.CreateFunctionRequest, existingSecrets map[string]*apiv1.Secret, factory k8s.FunctionFactory) (*appsv1.Deployment, error) {
 	envVars := buildEnvVars(&request)
-	var handler apiv1.Handler
-
-	if config.HTTPProbe {
-		handler = apiv1.Handler{
-			HTTPGet: &apiv1.HTTPGetAction{
-				Path: "/_/health",
-				Port: intstr.IntOrString{
-					Type:   intstr.Int,
-					IntVal: int32(watchdogPort),
-				},
-			},
-		}
-	} else {
-		path := filepath.Join(os.TempDir(), ".lock")
-		handler = apiv1.Handler{
-			Exec: &apiv1.ExecAction{
-				Command: []string{"cat", path},
-			},
-		}
-	}
-	readinessProbe := &apiv1.Probe{
-		Handler:             handler,
-		InitialDelaySeconds: config.FunctionReadinessProbeConfig.InitialDelaySeconds,
-		TimeoutSeconds:      config.FunctionReadinessProbeConfig.TimeoutSeconds,
-		PeriodSeconds:       config.FunctionReadinessProbeConfig.PeriodSeconds,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
-	livenessProbe := &apiv1.Probe{
-		Handler:             handler,
-		InitialDelaySeconds: config.FunctionLivenessProbeConfig.InitialDelaySeconds,
-		TimeoutSeconds:      config.FunctionLivenessProbeConfig.TimeoutSeconds,
-		PeriodSeconds:       config.FunctionLivenessProbeConfig.PeriodSeconds,
-		SuccessThreshold:    1,
-		FailureThreshold:    3,
-	}
 
 	initialReplicas := int32p(initialReplicasCount)
 	labels := map[string]string{
@@ -188,7 +133,7 @@ func makeDeploymentSpec(request requests.CreateFunctionRequest, existingSecrets 
 	}
 
 	var imagePullPolicy apiv1.PullPolicy
-	switch config.ImagePullPolicy {
+	switch factory.Config.ImagePullPolicy {
 	case "Never":
 		imagePullPolicy = apiv1.PullNever
 	case "IfNotPresent":
@@ -198,25 +143,39 @@ func makeDeploymentSpec(request requests.CreateFunctionRequest, existingSecrets 
 	}
 
 	annotations := buildAnnotations(request)
-	deploymentSpec := &v1beta1.Deployment{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Deployment",
-			APIVersion: "extensions/v1beta1",
-		},
+
+	var serviceAccount string
+
+	if request.Annotations != nil {
+		annotations := *request.Annotations
+		if val, ok := annotations["com.openfaas.serviceaccount"]; ok && len(val) > 0 {
+			serviceAccount = val
+		}
+	}
+
+	probes, err := factory.MakeProbes(request)
+	if err != nil {
+		return nil, err
+	}
+
+	deploymentSpec := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        request.Service,
 			Annotations: annotations,
+			Labels: map[string]string{
+				"faas_function": request.Service,
+			},
 		},
-		Spec: v1beta1.DeploymentSpec{
+		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"faas_function": request.Service,
 				},
 			},
 			Replicas: initialReplicas,
-			Strategy: v1beta1.DeploymentStrategy{
-				Type: v1beta1.RollingUpdateDeploymentStrategyType,
-				RollingUpdate: &v1beta1.RollingUpdateDeployment{
+			Strategy: appsv1.DeploymentStrategy{
+				Type: appsv1.RollingUpdateDeploymentStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDeployment{
 					MaxUnavailable: &intstr.IntOrString{
 						Type:   intstr.Int,
 						IntVal: int32(0),
@@ -241,26 +200,28 @@ func makeDeploymentSpec(request requests.CreateFunctionRequest, existingSecrets 
 							Name:  request.Service,
 							Image: request.Image,
 							Ports: []apiv1.ContainerPort{
-								{ContainerPort: int32(watchdogPort), Protocol: corev1.ProtocolTCP},
+								{ContainerPort: factory.Config.RuntimeHTTPPort, Protocol: corev1.ProtocolTCP},
 							},
 							Env:             envVars,
 							Resources:       *resources,
 							ImagePullPolicy: imagePullPolicy,
-							LivenessProbe:   livenessProbe,
-							ReadinessProbe:  readinessProbe,
+							LivenessProbe:   probes.Liveness,
+							ReadinessProbe:  probes.Readiness,
 							SecurityContext: &corev1.SecurityContext{
 								ReadOnlyRootFilesystem: &request.ReadOnlyRootFilesystem,
 							},
 						},
 					},
-					RestartPolicy: corev1.RestartPolicyAlways,
-					DNSPolicy:     corev1.DNSClusterFirst,
+					ServiceAccountName: serviceAccount,
+					RestartPolicy:      corev1.RestartPolicyAlways,
+					DNSPolicy:          corev1.DNSClusterFirst,
 				},
 			},
 		},
 	}
 
-	configureReadOnlyRootFilesystem(request, deploymentSpec)
+	factory.ConfigureReadOnlyRootFilesystem(request, deploymentSpec)
+	factory.ConfigureContainerUserID(deploymentSpec)
 
 	if err := UpdateSecrets(request, deploymentSpec, existingSecrets); err != nil {
 		return nil, err
@@ -269,7 +230,7 @@ func makeDeploymentSpec(request requests.CreateFunctionRequest, existingSecrets 
 	return deploymentSpec, nil
 }
 
-func makeServiceSpec(request requests.CreateFunctionRequest) *corev1.Service {
+func makeServiceSpec(request requests.CreateFunctionRequest, factory k8s.FunctionFactory) *corev1.Service {
 
 	serviceSpec := &corev1.Service{
 		TypeMeta: metav1.TypeMeta{
@@ -289,10 +250,10 @@ func makeServiceSpec(request requests.CreateFunctionRequest) *corev1.Service {
 				{
 					Name:     "http",
 					Protocol: corev1.ProtocolTCP,
-					Port:     watchdogPort,
+					Port:     factory.Config.RuntimeHTTPPort,
 					TargetPort: intstr.IntOrString{
 						Type:   intstr.Int,
-						IntVal: int32(watchdogPort),
+						IntVal: factory.Config.RuntimeHTTPPort,
 					},
 				},
 			},
@@ -410,48 +371,4 @@ func getMinReplicaCount(labels map[string]string) *int32 {
 	}
 
 	return nil
-}
-
-// configureReadOnlyRootFilesystem will create or update the required settings and mounts to ensure
-// that the ReadOnlyRootFilesystem setting works as expected, meaning:
-// 1. when ReadOnlyRootFilesystem is true, the security context of the container will have ReadOnlyRootFilesystem also
-//    marked as true and a new `/tmp` folder mount will be added to the deployment spec
-// 2. when ReadOnlyRootFilesystem is false, the security context of the container will also have ReadOnlyRootFilesystem set
-//    to false and there will be no mount for the `/tmp` folder
-//
-// This method is safe for both create and update operations.
-func configureReadOnlyRootFilesystem(request requests.CreateFunctionRequest, deployment *v1beta1.Deployment) {
-	if deployment.Spec.Template.Spec.Containers[0].SecurityContext != nil {
-		deployment.Spec.Template.Spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem = &request.ReadOnlyRootFilesystem
-	} else {
-		deployment.Spec.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{
-			ReadOnlyRootFilesystem: &request.ReadOnlyRootFilesystem,
-		}
-	}
-
-	existingVolumes := removeVolume("temp", deployment.Spec.Template.Spec.Volumes)
-	deployment.Spec.Template.Spec.Volumes = existingVolumes
-
-	existingMounts := removeVolumeMount("temp", deployment.Spec.Template.Spec.Containers[0].VolumeMounts)
-	deployment.Spec.Template.Spec.Containers[0].VolumeMounts = existingMounts
-
-	if request.ReadOnlyRootFilesystem {
-		deployment.Spec.Template.Spec.Volumes = append(
-			existingVolumes,
-			corev1.Volume{
-				Name: "temp",
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			},
-		)
-
-		deployment.Spec.Template.Spec.Containers[0].VolumeMounts = append(
-			existingMounts,
-			corev1.VolumeMount{
-				Name:      "temp",
-				MountPath: "/tmp",
-				ReadOnly:  false},
-		)
-	}
 }
